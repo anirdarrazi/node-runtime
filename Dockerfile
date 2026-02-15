@@ -1,16 +1,14 @@
-# Official vLLM deployment image (OpenAI server capable) :contentReference[oaicite:5]{index=5}
-FROM vllm/vllm-openai:latest
+FROM vllm/vllm-openai AS base
 
-# Install agent deps
-RUN pip install --no-cache-dir -r /dev/stdin <<'REQ'
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-httpx==0.27.2
-orjson==3.10.12
-REQ
+WORKDIR /workspace
 
-WORKDIR /app
-COPY agent.py /app/agent.py
+# Install python dependencies required by the agent. Websockets is
+# included to support the NodeBroker Durable Object integration.
+RUN pip install --no-cache-dir fastapi uvicorn[standard] httpx orjson websockets
 
-EXPOSE 8080
-CMD ["bash","-lc","uvicorn agent:app --host 0.0.0.0 --port 8080"]
+COPY agent.py ./agent.py
+
+# Expose the port the FastAPI server listens on
+EXPOSE 3000
+
+CMD ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "3000"]
