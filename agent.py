@@ -3,41 +3,41 @@ from typing import Optional, Dict, Any
 
 import httpx, orjson, websockets
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
+
 import subprocess
 
-# ---- required env ----
+# Required env vars
 WORKER_BASE_URL = os.environ["WORKER_BASE_URL"].rstrip("/")
 INTERNAL_ADMIN_TOKEN = os.environ["INTERNAL_ADMIN_TOKEN"]
 NODE_SHARED_SECRET = os.environ["NODE_SHARED_SECRET"]
 NODE_ID = os.environ.get("NODE_ID", str(uuid.uuid4()))
-PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")  # reachable from Workers
-MODEL_ID = os.environ["MODEL_ID"]                             # public model id (Radiance registry)
+MODEL_ID = os.environ["MODEL_ID"]
 MAX_INFLIGHT = int(os.environ.get("MAX_INFLIGHT", "256"))
 
 # vLLM runtime config
-VLLM_MODEL = os.environ["VLLM_MODEL"]                         # hf repo id or local path
+VLLM_MODEL = os.environ["VLLM_MODEL"]
 VLLM_PORT = int(os.environ.get("VLLM_PORT", "8000"))
 VLLM_HOST = os.environ.get("VLLM_HOST", "127.0.0.1")
 VLLM_ARGS = os.environ.get("VLLM_ARGS", "--dtype auto")
-VLLM_INTERNAL_API_KEY = os.environ.get("VLLM_INTERNAL_API_KEY", "")  # optional defense-in-depth
+VLLM_INTERNAL_API_KEY = os.environ.get("VLLM_INTERNAL_API_KEY", "")
 
 VLLM_BASE = f"http://{VLLM_HOST}:{VLLM_PORT}"
 
-# optional WebSocket URL for NodeBroker Durable Object (must be set by deployment)
+# WebSocket URL for NodeBroker Durable Object
 NODE_BROKER_WS_URL = os.environ.get("NODE_BROKER_WS_URL")
 
-# replay protection (in-memory; fine per-node)
+# Replay protection
 NONCE_TTL_SEC = 300
 _seen: Dict[str, float] = {}
 
-# in-flight control (fast 429 at the edge node)
+# In‑flight control (fast 429 at the edge node)
 _sem = asyncio.Semaphore(MAX_INFLIGHT)
 
 # vLLM process handle
 _vllm_proc: Optional[subprocess.Popen] = None
 
-# track in-flight DO invocations for cancellation
+# Track in‑flight DO invocations
 inflight_tasks: Dict[str, asyncio.Task] = {}
 
 app = FastAPI()
@@ -59,7 +59,6 @@ def hmac_b64(secret: str, msg: str) -> str:
     return base64.b64encode(sig).decode()
 
 def hmac_b64url(secret: str, msg: str) -> str:
-    """Return base64url-encoded HMAC without padding."""
     sig = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).digest()
     return base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
 
@@ -110,12 +109,9 @@ def start_vllm():
         return
 
     cmd = ["bash", "-lc"]
-    # vLLM OpenAI-compatible server via `vllm serve …` :contentReference[oaicite:3]{index=3}
-    # bind to localhost; agent proxies
     api_key_flag = f" --api-key {VLLM_INTERNAL_API_KEY}" if VLLM_INTERNAL_API_KEY else ""
     full = f"vllm serve '{VLLM_MODEL}' --host {VLLM_HOST} --port {VLLM_PORT}{api_key_flag} {VLLM_ARGS}"
     cmd.append(full)
-
     _vllm_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 async def wait_vllm_ready(timeout_sec: int = 180):
@@ -141,8 +137,8 @@ async def on_startup():
     start_vllm()
     await wait_vllm_ready()
 
-    # Register node & advertise model capacity to the Worker
-    await post_worker("/internal/nodes/register", {"id": NODE_ID, "base_url": PUBLIC_BASE_URL}, sign_body=False)
+    # Register node & advertise model capacity to the Worker (no base_url)
+    await post_worker("/internal/nodes/register", {"id": NODE_ID}, sign_body=False)
     await post_worker("/internal/nodes/models/set", {
         "node_id": NODE_ID,
         "models": [{"model_id": MODEL_ID, "max_concurrency": MAX_INFLIGHT}]
@@ -196,12 +192,6 @@ async def report_usage(job_id: str, user_id: str, api_key_id: str, model_id: str
         "error": error
     }, sign_body=True)
 
-def force_include_usage(req_json: Dict[str, Any]) -> None:
-    # include_usage handling is implemented in vLLM serving code, and behavior can differ by version :contentReference[oaicite:4]{index=4}
-    so = req_json.get("stream_options") or {}
-    so.setdefault("include_usage", True)
-    req_json["stream_options"] = so
-
 def build_ws_url() -> Optional[str]:
     """Construct the NodeBroker websocket URL with handshake params."""
     if not NODE_BROKER_WS_URL:
@@ -224,15 +214,14 @@ async def ws_ping(ws):
 
 async def handle_do_invoke(ws, rid: str, path: str, body: Dict[str, Any], headers: Dict[str, str]):
     """Handle an invocation sent by the NodeBroker."""
-    # Fast overload: don't queue locally (OpenRouter-style preference)
-    if _sem.locked() and _sem._value <= 0:  # type: ignore
+    if _sem.locked() and _sem._value <= 0:  # fast overload
         try:
-            await ws.send(orjson.dumps({"type": "error", "rid": rid, "status": 429, "error": {"code": "overloaded", "message": "node at capacity"}}).decode())
+            await ws.send(orjson.dumps({"type": "error", "rid": rid, "status": 429,
+                                        "error": {"code": "overloaded", "message": "node at capacity"}}).decode())
         except:
             pass
         return
     async with _sem:
-        # Determine job and auth metadata from headers
         job_id = headers.get("x-radiance-job-id", rid)
         user_id = headers.get("x-radiance-user-id", "")
         api_key_id = headers.get("x-radiance-api-key-id", "")
@@ -241,6 +230,7 @@ async def handle_do_invoke(ws, rid: str, path: str, body: Dict[str, Any], header
         combined_headers = {"content-type": "application/json", **with_vllm_headers()}
         try:
             if is_stream:
+                # ensure usage is included
                 force_include_usage(body)
                 started = time.time()
                 first_byte_at: Optional[float] = None
@@ -256,9 +246,8 @@ async def handle_do_invoke(ws, rid: str, path: str, body: Dict[str, Any], header
                             try:
                                 await ws.send(orjson.dumps({"type": "sse", "rid": rid, "chunk": chunk.decode()}).decode())
                             except:
-                                # connection closed; drop
                                 break
-                            # extract usage if present
+                            # extract usage
                             for line in chunk.split(b"\n"):
                                 if line.startswith(b"data: "):
                                     data = line[6:].strip()
@@ -269,12 +258,11 @@ async def handle_do_invoke(ws, rid: str, path: str, body: Dict[str, Any], header
                                                 last_usage = obj["usage"]
                                         except:
                                             pass
-                # finish streaming
+                # finish stream
                 try:
                     await ws.send(orjson.dumps({"type": "done", "rid": rid}).decode())
                 except:
                     pass
-                # compute metrics
                 ttft_ms = int((first_byte_at - started) * 1000) if first_byte_at else 0
                 prompt_tokens = int((last_usage or {}).get("prompt_tokens", 0))
                 completion_tokens = int((last_usage or {}).get("completion_tokens", 0))
@@ -283,9 +271,9 @@ async def handle_do_invoke(ws, rid: str, path: str, body: Dict[str, Any], header
                     dur = max(0.001, time.time() - first_byte_at)
                     tps = completion_tokens / dur
                 status_str = "succeeded"
-                await report_usage(job_id, user_id, api_key_id, model_id, status_str, prompt_tokens, completion_tokens, ttft_ms, tps, None)
+                await report_usage(job_id, user_id, api_key_id, model_id,
+                                   status_str, prompt_tokens, completion_tokens, ttft_ms, tps, None)
             else:
-                # non-streaming invocation
                 async with httpx.AsyncClient(timeout=None) as client:
                     r = await client.post(f"{VLLM_BASE}{path}", json=body, headers=combined_headers)
                 data = r.json()
@@ -299,21 +287,24 @@ async def handle_do_invoke(ws, rid: str, path: str, body: Dict[str, Any], header
                 completion_tokens = int(usage.get("completion_tokens", 0))
                 status_str = "succeeded" if status_code < 400 else "failed"
                 error_msg = None if status_code < 400 else (data.get("error") or str(data))
-                await report_usage(job_id, user_id, api_key_id, model_id, status_str, prompt_tokens, completion_tokens, 0, 0.0, error_msg)
+                await report_usage(job_id, user_id, api_key_id, model_id,
+                                   status_str, prompt_tokens, completion_tokens, 0, 0.0, error_msg)
         except asyncio.CancelledError:
-            # Invocation was cancelled by DO
             try:
-                await ws.send(orjson.dumps({"type": "error", "rid": rid, "status": 499, "error": {"code": "cancelled", "message": "cancelled"}}).decode())
+                await ws.send(orjson.dumps({"type": "error", "rid": rid, "status": 499,
+                                            "error": {"code": "cancelled", "message": "cancelled"}}).decode())
             except:
                 pass
-            await report_usage(job_id, user_id, api_key_id, model_id, "cancelled", 0, 0, 0, 0.0, "cancelled")
+            await report_usage(job_id, user_id, api_key_id, model_id,
+                               "cancelled", 0, 0, 0, 0.0, "cancelled")
         except Exception as e:
-            # Unexpected failure
             try:
-                await ws.send(orjson.dumps({"type": "error", "rid": rid, "status": 500, "error": {"code": "error", "message": str(e)}}).decode())
+                await ws.send(orjson.dumps({"type": "error", "rid": rid, "status": 500,
+                                            "error": {"code": "error", "message": str(e)}}).decode())
             except:
                 pass
-            await report_usage(job_id, user_id, api_key_id, model_id, "failed", 0, 0, 0, 0.0, str(e))
+            await report_usage(job_id, user_id, api_key_id, model_id,
+                               "failed", 0, 0, 0, 0.0, str(e))
         finally:
             inflight_tasks.pop(rid, None)
 
@@ -330,7 +321,6 @@ async def ws_listener(ws):
             path = msg.get("path", "/v1/chat/completions")
             body = msg.get("body") or {}
             headers = msg.get("headers") or {}
-            # schedule invocation
             task = asyncio.create_task(handle_do_invoke(ws, rid, path, body, headers))
             inflight_tasks[rid] = task
         elif mtype == "cancel":
@@ -360,188 +350,15 @@ async def do_ws_loop():
                 # spawn ping and listener tasks
                 ping_task = asyncio.create_task(ws_ping(ws))
                 listener_task = asyncio.create_task(ws_listener(ws))
-                done, pending = await asyncio.wait(
-                    [ping_task, listener_task], return_when=asyncio.FIRST_COMPLETED
-                )
+                done, pending = await asyncio.wait([ping_task, listener_task], return_when=asyncio.FIRST_COMPLETED)
                 for t in pending:
                     t.cancel()
         except Exception:
             # wait before reconnecting
             await asyncio.sleep(5)
 
-# ----- Public API endpoints proxied from Worker -----
-
-@app.post("/v1/chat/completions")
-async def chat(req: Request):
-    body = await req.body()
-    if not verify_worker_sig(req, body):
-        return JSONResponse({"error": {"code": "unauthorized", "message": "bad signature"}}, status_code=401)
-
-    # fast overload: don't queue locally (OpenRouter-style preference)
-    if _sem.locked() and _sem._value <= 0:  # type: ignore
-        return JSONResponse({"error": {"code": "overloaded", "message": "node at capacity"}}, status_code=429)
-
-    async with _sem:
-        job_id = req.headers.get("x-radiance-job-id", str(uuid.uuid4()))
-        user_id = req.headers.get("x-radiance-user-id", "")
-        api_key_id = req.headers.get("x-radiance-api-key-id", "")
-        req_json = orjson.loads(body)
-        model_id = req_json.get("model", MODEL_ID)
-
-        is_stream = bool(req_json.get("stream"))
-        headers = {"content-type": "application/json", **with_vllm_headers()}
-
-        if is_stream:
-            force_include_usage(req_json)
-            started = time.time()
-            first_byte_at: Optional[float] = None
-            last_usage: Optional[dict] = None
-            err: Optional[str] = None
-            status_str = "succeeded"
-
-            async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("POST", f"{VLLM_BASE}/v1/chat/completions", json=req_json, headers=headers) as upstream:
-                    async def gen():
-                        nonlocal first_byte_at, last_usage, err, status_str
-                        keepalive_sec = 10
-                        it = upstream.aiter_bytes()
-
-                        while True:
-                            try:
-                                chunk = await asyncio.wait_for(it.__anext__(), timeout=keepalive_sec)
-                            except asyncio.TimeoutError:
-                                # SSE keep-alive comment
-                                yield b":\n\n"
-                                continue
-                            except StopAsyncIteration:
-                                break
-
-                            if first_byte_at is None and chunk:
-                                first_byte_at = time.time()
-
-                            # capture usage if present in any SSE data lines
-                            for line in chunk.split(b"\n"):
-                                if line.startswith(b"data: "):
-                                    data_line = line[6:].strip()
-                                    if data_line and data_line != b"[DONE]":
-                                        try:
-                                            obj = orjson.loads(data_line)
-                                            if isinstance(obj, dict) and obj.get("usage"):
-                                                last_usage = obj["usage"]
-                                        except:
-                                            pass
-
-                            yield chunk
-
-                    resp = StreamingResponse(gen(), status_code=upstream.status_code,
-                                            media_type=upstream.headers.get("content-type", "text/event-stream"))
-
-            ttft_ms = int((first_byte_at - started) * 1000) if first_byte_at else 0
-            prompt_tokens = int((last_usage or {}).get("prompt_tokens", 0))
-            completion_tokens = int((last_usage or {}).get("completion_tokens", 0))
-            tps = 0.0
-            if first_byte_at and completion_tokens:
-                dur = max(0.001, time.time() - first_byte_at)
-                tps = completion_tokens / dur
-            await report_usage(job_id, user_id, api_key_id, model_id, status_str, prompt_tokens, completion_tokens, ttft_ms, tps, err)
-            return resp
-
-        # non-streaming
-        async with httpx.AsyncClient(timeout=None) as client:
-            r = await client.post(f"{VLLM_BASE}/v1/chat/completions", json=req_json, headers=headers)
-            data = r.json()
-
-        usage = data.get("usage") or {}
-        prompt_tokens = int(usage.get("prompt_tokens", 0))
-        completion_tokens = int(usage.get("completion_tokens", 0))
-        status_str = "succeeded" if r.status_code < 400 else "failed"
-        error_msg = None if r.status_code < 400 else (data.get("error") or str(data))
-
-        await report_usage(job_id, user_id, api_key_id, model_id, status_str, prompt_tokens, completion_tokens, 0, 0.0, error_msg)
-        return JSONResponse(data, status_code=r.status_code)
-
-@app.post("/v1/completions")
-async def completions(req: Request):
-    """Proxy text completions (OpenAI v1/completions)."""
-    body = await req.body()
-    if not verify_worker_sig(req, body):
-        return JSONResponse({"error": {"code": "unauthorized", "message": "bad signature"}}, status_code=401)
-
-    if _sem.locked() and _sem._value <= 0:  # type: ignore
-        return JSONResponse({"error": {"code": "overloaded", "message": "node at capacity"}}, status_code=429)
-
-    async with _sem:
-        job_id = req.headers.get("x-radiance-job-id", str(uuid.uuid4()))
-        user_id = req.headers.get("x-radiance-user-id", "")
-        api_key_id = req.headers.get("x-radiance-api-key-id", "")
-        req_json = orjson.loads(body)
-        model_id = req_json.get("model", MODEL_ID)
-
-        is_stream = bool(req_json.get("stream"))
-        headers = {"content-type": "application/json", **with_vllm_headers()}
-
-        if is_stream:
-            force_include_usage(req_json)
-            started = time.time()
-            first_byte_at: Optional[float] = None
-            last_usage: Optional[dict] = None
-            err: Optional[str] = None
-            status_str = "succeeded"
-
-            async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("POST", f"{VLLM_BASE}/v1/completions", json=req_json, headers=headers) as upstream:
-                    async def gen():
-                        nonlocal first_byte_at, last_usage, err, status_str
-                        keepalive_sec = 10
-                        it = upstream.aiter_bytes()
-
-                        while True:
-                            try:
-                                chunk = await asyncio.wait_for(it.__anext__(), timeout=keepalive_sec)
-                            except asyncio.TimeoutError:
-                                yield b":\n\n"
-                                continue
-                            except StopAsyncIteration:
-                                break
-
-                            if first_byte_at is None and chunk:
-                                first_byte_at = time.time()
-
-                            for line in chunk.split(b"\n"):
-                                if line.startswith(b"data: "):
-                                    data_line = line[6:].strip()
-                                    if data_line and data_line != b"[DONE]":
-                                        try:
-                                            obj = orjson.loads(data_line)
-                                            if isinstance(obj, dict) and obj.get("usage"):
-                                                last_usage = obj["usage"]
-                                        except:
-                                            pass
-                            yield chunk
-
-                    resp = StreamingResponse(gen(), status_code=upstream.status_code,
-                                            media_type=upstream.headers.get("content-type", "text/event-stream"))
-
-            ttft_ms = int((first_byte_at - started) * 1000) if first_byte_at else 0
-            prompt_tokens = int((last_usage or {}).get("prompt_tokens", 0))
-            completion_tokens = int((last_usage or {}).get("completion_tokens", 0))
-            tps = 0.0
-            if first_byte_at and completion_tokens:
-                dur = max(0.001, time.time() - first_byte_at)
-                tps = completion_tokens / dur
-            await report_usage(job_id, user_id, api_key_id, model_id, status_str, prompt_tokens, completion_tokens, ttft_ms, tps, err)
-            return resp
-
-        # non-streaming completions
-        async with httpx.AsyncClient(timeout=None) as client:
-            r = await client.post(f"{VLLM_BASE}/v1/completions", json=req_json, headers=headers)
-            data = r.json()
-
-        usage = data.get("usage") or {}
-        prompt_tokens = int(usage.get("prompt_tokens", 0))
-        completion_tokens = int(usage.get("completion_tokens", 0))
-        status_str = "succeeded" if r.status_code < 400 else "failed"
-        error_msg = None if r.status_code < 400 else (data.get("error") or str(data))
-
-        await report_usage(job_id, user_id, api_key_id, model_id, status_str, prompt_tokens, completion_tokens, 0, 0.0, error_msg)
-        return JSONResponse(data, status_code=r.status_code)
+def force_include_usage(req_json: Dict[str, Any]) -> None:
+    """Ensure usage is included in the request for streaming."""
+    so = req_json.get("stream_options") or {}
+    so.setdefault("include_usage", True)
+    req_json["stream_options"] = so

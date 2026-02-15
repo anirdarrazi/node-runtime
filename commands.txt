@@ -1,11 +1,10 @@
-docker build -t anirdarrazi/node-runtime:0.1 . 
+docker build -t your_dockerhub_username/radiance-node:latest .
 
 docker run --rm --gpus all --ipc=host -p 8080:8080 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -e HUGGING_FACE_HUB_TOKEN="<your_hf_token_if_needed>" \
   -e WORKER_BASE_URL="https://radiance-api.afvagroup.workers.dev" \
   -e INTERNAL_ADMIN_TOKEN="<same as Worker secret>" \
-  -e NODE_SHARED_SECRET="<same as Worker secret>" \
   -e NODE_ID="node-001" \
   -e PUBLIC_BASE_URL="https://node-001.radiance.yourdomain.com" \
   -e MODEL_ID="radiance/llama-3.1-8b-instruct-awq" \
