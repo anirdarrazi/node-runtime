@@ -1,0 +1,13 @@
+docker build -t anirdarrazi/radiance-node-runtime:latest .
+docker login
+docker push anirdarrazi/radiance-node-runtime:latest
+
+docker run -d \
+  --name radiance-node \
+  -p 3000:3000 \
+  -e WORKER_BASE_URL=https://api.yourdomain.com \
+  -e INTERNAL_ADMIN_TOKEN=d44be8866f127aff6bb5deb229e1b1bdbec3a32cd05591338c4e7cdcbd4c2cec \
+  -e NODE_SHARED_SECRET=cea35298fb91c24ac85a5e109f4582559b4b41ede130c03684c05b683a5b083c \
+  -e MODEL_ID=your_model_id \
+  -e VLLM_MODEL=your_model_name \
+  anirdarrazi/radiance-node-runtime:latest
