@@ -2,13 +2,13 @@ FROM vllm/vllm-openai AS base
 
 WORKDIR /workspace
 
-# Install python dependencies required by the agent. Websockets is
-# included to support the NodeBroker Durable Object integration.
-RUN pip install --no-cache-dir fastapi uvicorn[standard] httpx orjson websockets
+ENV PYTHONUNBUFFERED=1
+
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY agent.py ./agent.py
 
-# Expose the port the FastAPI server listens on
 EXPOSE 3000
 
 CMD ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "3000"]
