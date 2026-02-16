@@ -14,9 +14,13 @@ from typing import Any, Dict, Optional, Tuple
 
 import httpx
 import orjson
-import websockets
+import inspect, websockets
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+
+params = inspect.signature(websockets.connect).parameters
+kw = "additional_headers" if "additional_headers" in params else "extra_headers"
+cm = websockets.connect(ws_url, **{kw: headers})
 
 # -------------------------
 # Required env vars
@@ -515,10 +519,8 @@ async def do_ws_loop() -> None:
         try:
             # websockets API changed: some versions use additional_headers, others use extra_headers.
             # We'll try the new name first and fall back.
-            try:
-                cm = websockets.connect(ws_url, additional_headers=headers)
-            except TypeError:
-                cm = websockets.connect(ws_url, extra_headers=headers)
+            
+            cm = websockets.connect(ws_url, extra_headers=headers)
 
             async with cm as ws:
                 # reset backoff on successful connect
