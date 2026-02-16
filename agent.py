@@ -14,13 +14,28 @@ from typing import Any, Dict, Optional, Tuple
 
 import httpx
 import orjson
-import inspect, websockets
+import inspect
+import websockets
+
+# If you pass HF_TOKEN, mirror it to HUGGING_FACE_HUB_TOKEN so huggingface_hub/vLLM can authenticate.
+if os.getenv("HF_TOKEN") and not os.getenv("HUGGING_FACE_HUB_TOKEN"):
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+
+def ws_connect(ws_url: str, headers: dict[str, str]):
+    """Create a websockets.connect context manager with the correct header kw for the installed websockets version."""
+    try:
+        params = inspect.signature(websockets.connect).parameters
+        if "extra_headers" in params:
+            return websockets.connect(ws_url, extra_headers=headers)
+        if "additional_headers" in params:  # forward-compat
+            return websockets.connect(ws_url, additional_headers=headers)
+    except Exception:
+        pass
+    # Fallback for older versions
+    return websockets.connect(ws_url, extra_headers=headers)
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-
-params = inspect.signature(websockets.connect).parameters
-kw = "additional_headers" if "additional_headers" in params else "extra_headers"
-cm = websockets.connect(ws_url, **{kw: headers})
 
 # -------------------------
 # Required env vars
@@ -519,8 +534,8 @@ async def do_ws_loop() -> None:
         try:
             # websockets API changed: some versions use additional_headers, others use extra_headers.
             # We'll try the new name first and fall back.
-            
-            cm = websockets.connect(ws_url, extra_headers=headers)
+
+            cm = ws_connect(ws_url, headers)
 
             async with cm as ws:
                 # reset backoff on successful connect
