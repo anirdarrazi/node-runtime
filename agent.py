@@ -193,7 +193,7 @@ async def _tail_vllm_logs() -> None:
         return
 
 
-async def wait_vllm_ready(timeout_sec: int = 180) -> None:
+async def wait_vllm_ready(timeout_sec: int = 600) -> None:
     deadline = time.time() + timeout_sec
     headers = vllm_headers()
     async with httpx.AsyncClient(timeout=3.0) as client:

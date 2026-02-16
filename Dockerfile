@@ -11,4 +11,5 @@ COPY agent.py ./agent.py
 
 EXPOSE 3000
 
-CMD ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "3000"]
+ENTRYPOINT ["uvicorn"]
+CMD ["agent:app", "--host", "0.0.0.0", "--port", "3000"]
